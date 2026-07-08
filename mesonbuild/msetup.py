@@ -9,14 +9,17 @@ import cProfile as profile
 from pathlib import Path
 import typing as T
 
-from . import build, coredata, environment, interpreter, mesonlib, mintro, mlog
-from .mesonlib import MesonException
+from . import build, cmdline, coredata, environment, interpreter, mesonlib, mintro, mlog
+from .dependencies import Dependency
+from .mesonlib import MesonException, MachineChoice
+from .interpreterbase import ObjectHolder
 from .options import OptionKey
 
 if T.TYPE_CHECKING:
     from typing_extensions import Protocol
-    from .coredata import SharedCMDOptions
+    from .cmdline import SharedCMDOptions
     from .interpreter import SubprojectHolder
+    from .mesonlib import PerMachine
 
     class CMDOptions(SharedCMDOptions, Protocol):
 
@@ -38,11 +41,16 @@ syntax: glob
 **/*
 '''
 
+cachedir_tag_file = '''Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by meson.
+# For information about cache directory tags, see http://bford.info/cachedir/
+'''
+
 
 # Note: when adding arguments, please also add them to the completion
 # scripts in $MESONSRC/data/shell-completions/
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    coredata.register_builtin_arguments(parser)
+    cmdline.register_builtin_arguments(parser)
     parser.add_argument('--native-file',
                         default=[],
                         action='append',
@@ -80,7 +88,7 @@ class MesonApp:
             # configuration fails we need to be able to wipe again.
             restore = []
             with tempfile.TemporaryDirectory() as d:
-                for filename in [coredata.get_cmd_line_file(self.build_dir)] + glob.glob(os.path.join(self.build_dir, environment.Environment.private_dir, '*.ini')):
+                for filename in [cmdline.get_cmd_line_file(self.build_dir)] + glob.glob(os.path.join(self.build_dir, environment.Environment.private_dir, '*.ini')):
                     try:
                         restore.append((shutil.copy(filename, d), filename))
                     except FileNotFoundError:
@@ -88,7 +96,7 @@ class MesonApp:
                         # a partial build or is empty.
                         pass
 
-                coredata.read_cmd_line_file(self.build_dir, options)
+                cmdline.read_cmd_line_file(self.build_dir, options)
 
                 try:
                     # Don't delete the whole tree, just all of the files and
@@ -101,7 +109,7 @@ class MesonApp:
                         else:
                             mesonlib.windows_proof_rm(l)
                 finally:
-                    self.add_vcs_ignore_files(self.build_dir)
+                    self.add_ignore_files(self.build_dir)
                     for b, f in restore:
                         os.makedirs(os.path.dirname(f), exist_ok=True)
                         shutil.move(b, f)
@@ -146,18 +154,20 @@ class MesonApp:
             return ndir2, ndir1
         raise MesonException(f'{invalid_msg_prefix} contain a build file {environment.build_filename}.')
 
-    def add_vcs_ignore_files(self, build_dir: str) -> None:
+    def add_ignore_files(self, build_dir: str) -> None:
         with open(os.path.join(build_dir, '.gitignore'), 'w', encoding='utf-8') as ofile:
             ofile.write(git_ignore_file)
         with open(os.path.join(build_dir, '.hgignore'), 'w', encoding='utf-8') as ofile:
             ofile.write(hg_ignore_file)
+        with open(os.path.join(build_dir, 'CACHEDIR.TAG'), 'w', encoding='utf-8') as ofile:
+            ofile.write(cachedir_tag_file)
 
     def validate_dirs(self) -> T.Tuple[str, str]:
         (src_dir, build_dir) = self.validate_core_dirs(self.options.builddir, self.options.sourcedir)
         if Path(build_dir) in Path(src_dir).parents:
             raise MesonException(f'Build directory {build_dir} cannot be a parent of source directory {src_dir}')
         if not os.listdir(build_dir):
-            self.add_vcs_ignore_files(build_dir)
+            self.add_ignore_files(build_dir)
             return src_dir, build_dir
         priv_dir = os.path.join(build_dir, 'meson-private')
         has_valid_build = os.path.exists(os.path.join(priv_dir, 'coredata.dat'))
@@ -193,9 +203,12 @@ class MesonApp:
                                     'Some other Meson process is already using this build directory. Exiting.'):
             return self._generate(env, capture, vslite_ctx)
 
-    def check_unused_options(self, coredata: 'coredata.CoreData', cmd_line_options: T.Dict[OptionKey, str], all_subprojects: T.Mapping[str, SubprojectHolder]) -> None:
+    def check_unused_options(self, coredata: 'coredata.CoreData', cmd_line_options: T.Dict[OptionKey, str],
+                             all_subprojects: PerMachine[T.Dict[str, SubprojectHolder]]) -> None:
         errlist: T.List[str] = []
-        known_subprojects = [name for name, obj in all_subprojects.items() if obj.found()]
+        known_subprojects: T.Set[str] = set()
+        for m in MachineChoice:
+            known_subprojects.update((name for name, obj in all_subprojects[m].items() if obj.found()))
         for opt in cmd_line_options:
             # Accept options that exist or could appear in subsequent reconfigurations,
             # including options for subprojects that were not used
@@ -217,11 +230,11 @@ class MesonApp:
         # Get all user defined options, including options that have been defined
         # during a previous invocation or using meson configure.
         user_defined_options = T.cast('CMDOptions', argparse.Namespace(**vars(self.options)))
-        coredata.read_cmd_line_file(self.build_dir, user_defined_options)
+        cmdline.read_cmd_line_file(self.build_dir, user_defined_options)
 
         mlog.debug('Build started at', datetime.datetime.now().isoformat())
         mlog.debug('Main binary:', sys.executable)
-        mlog.debug('Build Options:', coredata.format_cmd_line_options(user_defined_options))
+        mlog.debug('Build Options:', cmdline.format_cmd_line_options(user_defined_options))
         mlog.debug('Python system:', platform.system())
         mlog.log(mlog.bold('The Meson build system'))
         mlog.log('Version:', coredata.version)
@@ -287,9 +300,9 @@ class MesonApp:
                 # read from a pipe and wrote into a private file.
                 self.options.cross_file = env.coredata.cross_files
                 self.options.native_file = env.coredata.config_files
-                coredata.write_cmd_line_file(self.build_dir, self.options)
+                cmdline.write_cmd_line_file(self.build_dir, self.options)
             else:
-                coredata.update_cmd_line_file(self.build_dir, self.options)
+                cmdline.update_cmd_line_file(self.build_dir, self.options)
 
             # Generate an IDE introspection file with the same syntax as the already existing API
             if self.options.profile:
@@ -337,9 +350,16 @@ class MesonApp:
         return captured_compile_args
 
     def finalize_postconf_hooks(self, b: build.Build, intr: interpreter.Interpreter) -> None:
+        for varname, holder in intr.variables.items():
+            if isinstance(holder, ObjectHolder):
+                d = holder.held_object
+                if isinstance(d, Dependency) and d.found():
+                    d.meson_variables.append(varname)
+
         b.devenv.append(intr.backend.get_devenv())
         for mod in intr.modules.values():
             mod.postconf_hook(b)
+        b.def_files = intr.get_build_def_files()
 
 def run_genvslite_setup(options: CMDOptions) -> None:
     # With --genvslite, we essentially want to invoke multiple 'setup' iterations. I.e. -
@@ -355,7 +375,7 @@ def run_genvslite_setup(options: CMDOptions) -> None:
     # The command line may specify a '--backend' option, which doesn't make sense in conjunction with
     # '--genvslite', where we always want to use a ninja back end -
     k_backend = OptionKey('backend')
-    if k_backend in options.cmd_line_options.keys():
+    if k_backend in options.cmd_line_options:
         if options.cmd_line_options[k_backend] != 'ninja':
             raise MesonException('Explicitly specifying a backend option with \'genvslite\' is not necessary '
                                  '(the ninja backend is always used) but specifying a non-ninja backend '
@@ -381,14 +401,14 @@ def run(options: T.Union[CMDOptions, T.List[str]]) -> int:
         parser = argparse.ArgumentParser()
         add_arguments(parser)
         options = T.cast('CMDOptions', parser.parse_args(options))
-    coredata.parse_cmd_line_options(options)
+    cmdline.parse_cmd_line_options(options)
 
     # Msetup doesn't actually use this option, but we pass msetup options to
     # mconf, and it does. We won't actually hit the path that uses it, but don't
     # lie
     options.pager = False
 
-    if OptionKey('genvslite') in options.cmd_line_options.keys():
+    if OptionKey('genvslite') in options.cmd_line_options:
         run_genvslite_setup(options)
     else:
         app = MesonApp(options)

@@ -47,25 +47,24 @@ example: |
   My Project 1.0
 
     Directories
-      prefix         : /opt/gnome
       bindir         : bin
       libdir         : lib/x86_64-linux-gnu
       datadir        : share
 
     Configuration
-      Some boolean   : False
-      Another boolean: True
+      Some boolean   : false
+      Another boolean: true
       Some string    : Hello World
-      An array        : string
+      An array       : string
                        1
-                       True
+                       true
   ```
 
 arg_flattening: false
 
 posargs:
   key_or_dict:
-    type: str | dict[str | bool | int | dep | external_program | array[str | bool | int | dep | external_program]]
+    type: str | dict[str | bool | int | dep | program | array[str | bool | int | dep | program]]
     description: |
       The name of the new entry, or a dict containing multiple entries.  If a
       dict is passed it is equivalent to calling summary() once for each
@@ -74,7 +73,7 @@ posargs:
 
 optargs:
   value:
-    type: str | bool | int | dep | external_program | array[str | bool | int | dep | external_program]
+    type: str | bool | int | dep | program | array[str | bool | int | dep | program]
     description: |
       The value to print for the `key`.  Only valid if `key_or_dict` is a str.
 

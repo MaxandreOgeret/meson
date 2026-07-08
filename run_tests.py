@@ -32,7 +32,9 @@ from mesonbuild import mesonlib
 from mesonbuild import mesonmain
 from mesonbuild import mtest
 from mesonbuild import mlog
-from mesonbuild.environment import Environment, detect_ninja, detect_machine_info
+from mesonbuild.environment import Environment
+from mesonbuild.envconfig import detect_machine_info
+from mesonbuild.tooldetect import detect_ninja
 from mesonbuild.coredata import version as meson_version
 from mesonbuild.options import backendlist
 from mesonbuild.mesonlib import setup_vsenv
@@ -134,6 +136,7 @@ def _using_intelcl() -> bool:
 class FakeBuild:
     def __init__(self, env):
         self.environment = env
+        self.machine_map = env.machine_map
 
 def get_fake_options(prefix: str = '') -> SharedCMDOptions:
     opts = T.cast('SharedCMDOptions', argparse.Namespace())

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .base import ExternalDependency, DependencyException, sort_libpaths, DependencyTypeName
 from ..mesonlib import (EnvironmentVariables, OrderedSet, PerMachine, Popen_safe, Popen_safe_logged, MachineChoice,
-                        join_args, MesonException)
+                        join_args, MesonException, path_has_root)
 from ..options import OptionKey
 from ..programs import find_external_program, ExternalProgram
 from .. import mlog
@@ -25,6 +25,7 @@ if T.TYPE_CHECKING:
     from ..environment import Environment
     from ..utils.core import EnvironOrDict
     from ..interpreter.type_checking import PkgConfigDefineType
+    from .base import DependencyObjectKWs
 
 class PkgConfigInterface:
     '''Base class wrapping a pkg-config implementation'''
@@ -45,7 +46,6 @@ class PkgConfigInterface:
     def instance(env: Environment, for_machine: MachineChoice, silent: bool,
                  extra_paths: T.Optional[T.List[str]] = None) -> T.Optional[PkgConfigInterface]:
         '''Return a pkg-config implementation singleton'''
-        for_machine = for_machine if env.is_cross_build() else MachineChoice.HOST
         extra_paths_key = tuple(extra_paths) if extra_paths is not None else None
         impl = PkgConfigInterface.class_impl[for_machine].get(extra_paths_key, False)
         if impl is False:
@@ -65,7 +65,6 @@ class PkgConfigInterface:
         Even when we use another implementation internally, external tools might
         still need the CLI implementation.
         '''
-        for_machine = for_machine if env.is_cross_build() else MachineChoice.HOST
         impl: T.Union[Literal[False], T.Optional[PkgConfigInterface]] # Help confused mypy
         impl = PkgConfigInterface.instance(env, for_machine, silent)
         if impl and not isinstance(impl, PkgConfigCLI):
@@ -102,7 +101,7 @@ class PkgConfigInterface:
         '''Return module version or None if not found'''
         raise NotImplementedError
 
-    def cflags(self, name: str, allow_system: bool = False,
+    def cflags(self, name: str, static: bool = False, allow_system: bool = False,
                define_variable: PkgConfigDefineType = None) -> ImmutableListProtocol[str]:
         '''Return module cflags
            @allow_system: If False, remove default system include paths
@@ -156,7 +155,7 @@ class PkgConfigCLI(PkgConfigInterface):
         return ret
 
     @lru_cache(maxsize=None)
-    def cflags(self, name: str, allow_system: bool = False,
+    def cflags(self, name: str, static: bool = False, allow_system: bool = False,
                define_variable: PkgConfigDefineType = None) -> ImmutableListProtocol[str]:
         env = None
         if allow_system:
@@ -164,6 +163,8 @@ class PkgConfigCLI(PkgConfigInterface):
             env['PKG_CONFIG_ALLOW_SYSTEM_CFLAGS'] = '1'
         args: T.List[str] = []
         args += self._define_variable_args(define_variable)
+        if static:
+            args.append('--static')
         args += ['--cflags', name]
         ret, out, err = self._call_pkgbin(args, env=env)
         if ret != 0:
@@ -305,11 +306,11 @@ class PkgConfigCLI(PkgConfigInterface):
 
 class PkgConfigDependency(ExternalDependency):
 
-    def __init__(self, name: str, environment: Environment, kwargs: T.Dict[str, T.Any],
-                 language: T.Optional[str] = None,
+    type_name = DependencyTypeName('pkgconfig')
+
+    def __init__(self, name: str, environment: Environment, kwargs: DependencyObjectKWs,
                  extra_paths: T.Optional[T.List[str]] = None) -> None:
-        super().__init__(DependencyTypeName('pkgconfig'), environment, kwargs, language=language)
-        self.name = name
+        super().__init__(name, environment, kwargs)
         self.is_libtool = False
         self.extra_paths = extra_paths or []
         pkgconfig = PkgConfigInterface.instance(self.env, self.for_machine, self.silent, self.extra_paths)
@@ -334,7 +335,7 @@ class PkgConfigDependency(ExternalDependency):
             # Fetch the libraries and library paths needed for using this
             self._set_libs()
         except DependencyException as e:
-            mlog.debug(f"Pkg-config error with '{name}': {e}")
+            mlog.warning(f"Pkg-config error with '{name}': {e}")
             if self.required:
                 raise
             else:
@@ -385,7 +386,7 @@ class PkgConfigDependency(ExternalDependency):
             # gfortran doesn't appear to look in system paths for INCLUDE files,
             # so don't allow pkg-config to suppress -I flags for system paths
             allow_system = True
-        cflags = self.pkgconfig.cflags(self.name, allow_system)
+        cflags = self.pkgconfig.cflags(self.name, self.static, allow_system)
         self.compile_args = self._convert_mingw_paths(cflags)
 
     def _search_libs(self, libs_in: ImmutableListProtocol[str], raw_libs_in: ImmutableListProtocol[str]) -> T.Tuple[T.List[str], T.List[str]]:
@@ -419,7 +420,7 @@ class PkgConfigDependency(ExternalDependency):
         for arg in raw_link_args:
             if arg.startswith('-L') and not arg.startswith(('-L-l', '-L-L')):
                 path = arg[2:]
-                if not os.path.isabs(path):
+                if not path_has_root(path):
                     # Resolve the path as a compiler in the build directory would
                     path = os.path.join(self.env.get_build_dir(), path)
                 prefix_libpaths.add(path)
@@ -432,7 +433,7 @@ class PkgConfigDependency(ExternalDependency):
         #
         # Only prefix_libpaths are reordered here because there should not be
         # too many system_libpaths to cause library version issues.
-        pkg_config_path: T.List[str] = self.env.coredata.optstore.get_value(OptionKey('pkg_config_path', machine=self.for_machine)) # type: ignore[assignment]
+        pkg_config_path: T.List[str] = self.env.coredata.optstore.get_value_for(OptionKey('pkg_config_path', machine=self.for_machine)) # type: ignore[assignment]
         pkg_config_path = self._convert_mingw_paths(pkg_config_path)
         prefix_libpaths = OrderedSet(sort_libpaths(list(prefix_libpaths), pkg_config_path))
         system_libpaths: OrderedSet[str] = OrderedSet()
@@ -487,9 +488,12 @@ class PkgConfigDependency(ExternalDependency):
                 if lib in libs_found:
                     continue
                 if self.clib_compiler:
-                    args = self.clib_compiler.find_library(lib[2:], self.env,
-                                                           libpaths, self.libtype,
-                                                           lib_prefix_warning=False)
+                    # Libraries from pkg-config are trusted to be linkable, so
+                    # we skip the potentially expensive link check for
+                    # performance reasons.
+                    args = self.clib_compiler.find_library(
+                        lib[2:], libpaths, self.libtype, lib_prefix_warning=False,
+                        skip_link_check=True)
                 # If the project only uses a non-clib language such as D, Rust,
                 # C#, Python, etc, all we can do is limp along by adding the
                 # arguments as-is and then adding the libpaths at the end.
@@ -553,7 +557,7 @@ class PkgConfigDependency(ExternalDependency):
     def extract_field(self, la_file: str, fieldname: str) -> T.Optional[str]:
         with open(la_file, encoding='utf-8') as f:
             for line in f:
-                arr = line.strip().split('=')
+                arr = line.strip().split('=', 1)
                 if arr[0] == fieldname:
                     return arr[1][1:-1]
         return None
@@ -584,10 +588,6 @@ class PkgConfigDependency(ExternalDependency):
         # From the comments in extract_libtool(), older libtools had
         # a path rather than the raw dlname
         return os.path.basename(dlname)
-
-    @staticmethod
-    def log_tried() -> str:
-        return 'pkgconfig'
 
     def get_variable(self, *, cmake: T.Optional[str] = None, pkgconfig: T.Optional[str] = None,
                      configtool: T.Optional[str] = None, internal: T.Optional[str] = None,

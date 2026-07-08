@@ -13,6 +13,7 @@ import typing as T
 import collections
 
 from . import build
+from . import cmdline
 from . import coredata
 from . import options
 from . import environment
@@ -20,7 +21,7 @@ from . import mesonlib
 from . import mintro
 from . import mlog
 from .ast import AstIDGenerator, IntrospectionInterpreter
-from .mesonlib import MachineChoice
+from .mesonlib import MachineChoice, unwrap
 from .options import OptionKey
 from .optinterpreter import OptionInterpreter
 
@@ -28,7 +29,7 @@ if T.TYPE_CHECKING:
     from typing_extensions import Protocol
     import argparse
 
-    class CMDOptions(coredata.SharedCMDOptions, Protocol):
+    class CMDOptions(cmdline.SharedCMDOptions, Protocol):
 
         builddir: str
         clearcache: bool
@@ -40,13 +41,13 @@ if T.TYPE_CHECKING:
 # Note: when adding arguments, please also add them to the completion
 # scripts in $MESONSRC/data/shell-completions/
 def add_arguments(parser: 'argparse.ArgumentParser') -> None:
-    coredata.register_builtin_arguments(parser)
+    cmdline.register_builtin_arguments(parser)
     parser.add_argument('builddir', nargs='?', default='.')
     parser.add_argument('--clearcache', action='store_true', default=False,
                         help='Clear cached state (e.g. found dependencies)')
     parser.add_argument('--no-pager', action='store_false', dest='pager',
                         help='Do not redirect output to a pager')
-    parser.add_argument('-U', action=coredata.KeyNoneAction, dest='cmd_line_options', default={},
+    parser.add_argument('-U', action=cmdline.KeyNoneAction, dest='cmd_line_options', default={},
                         help='Remove a subproject option.')
 
 def stringify(val: T.Any) -> str:
@@ -188,8 +189,8 @@ class Conf:
                 mlog.log(*items)
 
     def split_options_per_subproject(self, opts: T.Union[options.MutableKeyedOptionDictType, options.OptionStore]
-                                     ) -> T.Dict[str, options.MutableKeyedOptionDictType]:
-        result: T.Dict[str, options.MutableKeyedOptionDictType] = {}
+                                     ) -> T.Dict[str | None, options.MutableKeyedOptionDictType]:
+        result: T.Dict[str | None, options.MutableKeyedOptionDictType] = {}
         for k, o in opts.items():
             if k.subproject is not None:
                 self.all_subprojects.add(k.subproject)
@@ -240,14 +241,11 @@ class Conf:
             return
         if title:
             self.add_title(title)
-        #auto = T.cast('options.UserFeatureOption', self.coredata.optstore.get_value_for('auto_features'))
         for k, o in sorted(opts.items()):
             printable_value = o.printable_value()
             #root = k.as_root()
             #if o.yielding and k.subproject and root in self.coredata.options:
             #    printable_value = '<inherited from main project>'
-            #if isinstance(o, options.UserFeatureOption) and o.is_auto():
-            #    printable_value = auto.printable_value()
             self.add_option(k, o.description, printable_value, o.printable_choices())
 
     def print_conf(self, pager: bool) -> None:
@@ -280,10 +278,9 @@ class Conf:
                 dir_options[k] = v
             elif k in test_option_names:
                 test_options[k] = v
-            elif k.has_module_prefix():
+            elif (modname := k.get_module_prefix()) is not None:
                 # Ignore module options if we did not use that module during
                 # configuration.
-                modname = k.get_module_prefix()
                 if self.build and modname not in self.build.modules:
                     continue
                 module_options[modname][k] = v
@@ -295,7 +292,7 @@ class Conf:
         host_compiler_options = self.split_options_per_subproject({k: v for k, v in self.coredata.optstore.items() if self.coredata.optstore.is_compiler_option(k) and k.machine is MachineChoice.HOST})
         build_compiler_options = self.split_options_per_subproject({k: v for k, v in self.coredata.optstore.items() if self.coredata.optstore.is_compiler_option(k) and k.machine is MachineChoice.BUILD})
         project_options = self.split_options_per_subproject({k: v for k, v in self.coredata.optstore.items() if self.coredata.optstore.is_project_option(k)})
-        show_build_options = self.default_values_only or self.build.environment.is_cross_build()
+        show_build_options = self.default_values_only or unwrap(self.build).environment.is_cross_build()
 
         self.add_section('Global build options')
         self.print_options('Core options', host_core_options[None])
@@ -340,10 +337,19 @@ class Conf:
         mismatching = self.coredata.get_nondefault_buildtype_args()
         if not mismatching:
             return
-        mlog.log("\nThe following option(s) have a different value than the build type default\n")
-        mlog.log('               current   default')
-        for m in mismatching:
-            mlog.log(f'{m[0]:21}{m[1]:10}{m[2]:10}')
+        items = [(stringify(m[0]), stringify(m[1]), stringify(m[2])) for m in mismatching]
+        max_name_len = max(len(item[0]) for item in items)
+        max_current_len = max(len(item[1]) for item in items)
+        padding1 = ' ' * (max_name_len + 1)
+        padding2 = ' ' * (max_current_len - len('Current'))
+        mlog.log("\nThe following option(s) have a different value than the build type default:\n")
+        mlog.log(' ', padding1, mlog.cyan('Current'), padding2, mlog.cyan('Default'))
+        mlog.log(' ', padding1, '-' * len('Current'), padding2, '-' * len('Default'))
+        for item in items:
+            name, current, default = item
+            padding1 = ' ' * (max_name_len - len(name))
+            padding2 = ' ' * (max(max_current_len, len('Current')) - len(current))
+            mlog.log(' ', mlog.green(name), padding1, mlog.yellow(current), padding2, mlog.blue(default))
 
     def print_augments(self) -> None:
         if self.coredata.optstore.augments:
@@ -377,14 +383,15 @@ def run_impl(options: CMDOptions, builddir: str) -> int:
         save = False
         if has_option_flags(options):
             save |= c.coredata.set_from_configure_command(options)
-            coredata.update_cmd_line_file(builddir, options)
+            cmdline.update_cmd_line_file(builddir, options)
         if options.clearcache:
             c.clear_cache()
             save = True
         if save:
             c.save()
-            mintro.update_build_options(c.coredata, c.build.environment.info_dir)
-            mintro.write_meson_info_file(c.build, [])
+            build = unwrap(c.build)
+            mintro.update_build_options(c.coredata, build.environment.info_dir)
+            mintro.write_meson_info_file(build, [])
     except ConfException as e:
         mlog.log('Meson configurator encountered an error:')
         if c is not None and c.build is not None:
@@ -396,6 +403,6 @@ def run_impl(options: CMDOptions, builddir: str) -> int:
     return 0
 
 def run(options: CMDOptions) -> int:
-    coredata.parse_cmd_line_options(options)
+    cmdline.parse_cmd_line_options(options)
     builddir = os.path.abspath(os.path.realpath(options.builddir))
     return run_impl(options, builddir)

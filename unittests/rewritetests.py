@@ -8,14 +8,17 @@ import os
 from pathlib import Path
 import shutil
 import unittest
+import typing as T
 
 from mesonbuild.ast import IntrospectionInterpreter, AstIDGenerator
 from mesonbuild.ast.printer import RawPrinter
-from mesonbuild.mesonlib import windows_proof_rmtree
+from mesonbuild.mesonlib import windows_proof_rmtree, is_windows, is_linux
+
 from .baseplatformtests import BasePlatformTests
+from .helpers import skip_if_not_language
 
 class RewriterTests(BasePlatformTests):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.maxDiff = None
 
@@ -24,7 +27,7 @@ class RewriterTests(BasePlatformTests):
             windows_proof_rmtree(self.builddir)
         shutil.copytree(os.path.join(self.rewrite_test_dir, dirname), self.builddir)
 
-    def rewrite_raw(self, directory, args):
+    def rewrite_raw(self, directory: str, args: T.Sequence[str]) -> T.Dict:
         if isinstance(args, str):
             args = [args]
         command = self.rewrite_command + ['--verbose', '--skip', '--sourcedir', directory] + args
@@ -41,7 +44,7 @@ class RewriterTests(BasePlatformTests):
             return {}
         return json.loads(p.stdout)
 
-    def rewrite(self, directory, args):
+    def rewrite(self, directory: str, args: T.Sequence[str]) -> T.Dict:
         if isinstance(args, str):
             args = [args]
         return self.rewrite_raw(directory, ['command'] + args)
@@ -289,13 +292,30 @@ class RewriterTests(BasePlatformTests):
         }
         self.assertDictEqual(out, expected)
 
+    def test_kwargs_info_dict(self):
+        self.prime('8 kwargs dict')
+        out = self.rewrite(self.builddir, os.path.join(self.builddir, 'info.json'))
+        expected = {
+            'kwargs': {
+                'project#/': {
+                    'default_options': {'c_std': 'c11', 'cpp_std': 'c++17'},
+                    'version': '0.0.1'
+                },
+                'dependency#dep1': {
+                    'default_options': {'foo': 'bar'},
+                    'required': False
+                }
+            }
+        }
+        self.assertDictEqual(out, expected)
+
     def test_kwargs_set(self):
         self.prime('3 kwargs')
         self.rewrite(self.builddir, os.path.join(self.builddir, 'set.json'))
         out = self.rewrite(self.builddir, os.path.join(self.builddir, 'info.json'))
         expected = {
             'kwargs': {
-                'project#/': {'version': '0.0.2', 'meson_version': '0.50.0', 'license': ['GPL', 'MIT']},
+                'project#/': {'version': '0.0.2', 'meson_version': '0.50.0', 'license': ['GPL', 'MIT'], 'license_files': ['GPL.txt', 'MIT.txt']},
                 'target#tgt1': {'build_by_default': False, 'build_rpath': '/usr/local', 'dependencies': 'dep1'},
                 'dependency#dep1': {'required': True, 'method': 'cmake'}
             }
@@ -308,7 +328,7 @@ class RewriterTests(BasePlatformTests):
         out = self.rewrite(self.builddir, os.path.join(self.builddir, 'info.json'))
         expected = {
             'kwargs': {
-                'project#/': {'version': '0.0.1', 'license': ['GPL', 'MIT', 'BSD', 'Boost']},
+                'project#/': {'version': '0.0.1', 'license': ['GPL', 'MIT', 'BSD', 'Boost'], 'license_files': 'GPL.txt'},
                 'target#tgt1': {'build_by_default': True},
                 'dependency#dep1': {'required': False}
             }
@@ -428,8 +448,18 @@ class RewriterTests(BasePlatformTests):
         out = self.rewrite(self.builddir, os.path.join(self.builddir, 'info.json'))
         self.assertEqualIgnoreOrder(out, expected)
 
+    def test_duplicate_globals(self):
+        self.prime('10 duplicate globals')
+        out = self.rewrite(self.builddir, os.path.join(self.builddir, 'info.json'))
+        expected = {
+            'kwargs': {
+                'project#/': {'license': 'MIT'}
+            }
+        }
+        self.assertEqualIgnoreOrder(out, expected)
+
     def test_tricky_dataflow(self):
-        self.prime('8 tricky dataflow')
+        self.prime('9 tricky dataflow')
         out = self.rewrite(self.builddir, os.path.join(self.builddir, 'addSrc.json'))
         expected = {
             'target': {
@@ -449,7 +479,7 @@ class RewriterTests(BasePlatformTests):
         self.assertEqualIgnoreOrder(out, expected)
 
     def test_raw_printer_is_idempotent(self):
-        test_path = Path(self.unit_test_dir, '120 rewrite')
+        test_path = Path(self.unit_test_dir, '121 rewrite')
         meson_build_file = test_path / 'meson.build'
         # original_contents = meson_build_file.read_bytes()
         original_contents = meson_build_file.read_text(encoding='utf-8')
@@ -498,5 +528,11 @@ class RewriterTests(BasePlatformTests):
             for source in sorted(interpreter.dataflow_dag.tgt_to_srcs[target], key=sortkey):
                 dag_as_str += f"    {node_to_str(source)}\n"
 
-        expected = Path(test_path / "expected_dag.txt").read_text().strip()
+        expected = Path(test_path / "expected_dag.txt").read_text(encoding='utf-8').strip()
         self.assertEqual(dag_as_str.strip(), expected)
+
+    @skip_if_not_language('nasm')
+    def test_nasm(self) -> None:
+        srcdir = os.path.join(self.unit_test_dir, '134 nasm language only')
+        self.rewrite_raw(srcdir, ['kwargs', 'info', 'project', '/'])
+

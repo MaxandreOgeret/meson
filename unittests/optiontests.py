@@ -2,8 +2,14 @@
 # Copyright 2024 Meson project contributors
 
 from mesonbuild.options import *
+from mesonbuild.envconfig import MachineInfo
 
+import os
 import unittest
+
+
+def make_machine(system: str) -> MachineInfo:
+    return MachineInfo(system, 'x86_64', 'x86_64', 'little', None, None)
 
 
 def num_options(store: OptionStore) -> int:
@@ -260,8 +266,7 @@ class OptionTests(unittest.TestCase):
 
         cmd_line = {key: opt_value}
         optstore.initialize_from_top_level_project_call({}, cmd_line, {})
-        self.assertEqual(optstore.get_value_object_and_value_for(key.as_build())[1], opt_value)
-        self.assertEqual(optstore.get_value(key.as_build()), opt_value)
+        self.assertEqual(optstore.get_option_and_value_for(key.as_build())[1], opt_value)
         self.assertEqual(optstore.get_value_for(key.as_build()), opt_value)
 
     def test_build_to_host_subproject(self):
@@ -280,10 +285,8 @@ class OptionTests(unittest.TestCase):
         spcall = {key: opt_value}
         optstore.initialize_from_top_level_project_call({}, {}, {})
         optstore.initialize_from_subproject_call(subp, spcall, {}, {}, {})
-        self.assertEqual(optstore.get_value_object_and_value_for(key.evolve(subproject=subp,
+        self.assertEqual(optstore.get_option_and_value_for(key.evolve(subproject=subp,
                                                                             machine=MachineChoice.BUILD))[1], opt_value)
-        self.assertEqual(optstore.get_value(key.evolve(subproject=subp,
-                                                       machine=MachineChoice.BUILD)), opt_value)
         self.assertEqual(optstore.get_value_for(key.evolve(subproject=subp,
                                                            machine=MachineChoice.BUILD)), opt_value)
 
@@ -304,17 +307,10 @@ class OptionTests(unittest.TestCase):
         optstore.initialize_from_top_level_project_call({}, cmd_line, {})
         print(optstore.options)
 
-        self.assertEqual(optstore.get_value_object_and_value_for(key)[1], opt_value)
-        self.assertEqual(optstore.get_value_object_and_value_for(key.as_build())[1], def_value)
-        self.assertEqual(optstore.get_value(key), opt_value)
-        self.assertEqual(optstore.get_value(key.as_build()), def_value)
+        self.assertEqual(optstore.get_option_and_value_for(key)[1], opt_value)
+        self.assertEqual(optstore.get_option_and_value_for(key.as_build())[1], def_value)
         self.assertEqual(optstore.get_value_for(key), opt_value)
         self.assertEqual(optstore.get_value_for(key.as_build()), def_value)
-
-    def test_b_default(self):
-        optstore = OptionStore(False)
-        value = optstore.get_default_for_b_option(OptionKey('b_vscrt'))
-        self.assertEqual(value, 'from_buildtype')
 
     def test_b_nonexistent(self):
         optstore = OptionStore(False)
@@ -472,5 +468,174 @@ class OptionTests(unittest.TestCase):
                               deprecated={'true': '1'})
         optstore.add_system_option(name, do)
         optstore.set_option(OptionKey(name), True)
-        value = optstore.get_value(name)
+        value = optstore.get_value_for(name)
         self.assertEqual(value, '1')
+
+    def test_pending_augment_validation(self):
+        name = 'b_lto'
+        subproject = 'mysubproject'
+
+        optstore = OptionStore(False)
+        prefix = UserStringOption('prefix', 'This is needed by OptionStore', '/usr')
+        optstore.add_system_option('prefix', prefix)
+
+        optstore.initialize_from_top_level_project_call({}, {}, {})
+        optstore.initialize_from_subproject_call(subproject, {}, {OptionKey(name): 'true'}, {}, {})
+
+        bo = UserBooleanOption(name, 'LTO', False)
+        key = OptionKey(name, subproject=subproject)
+        optstore.add_system_option(key, bo)
+        stored_value = optstore.get_value_for(key)
+        self.assertIsInstance(stored_value, bool)
+        self.assertTrue(stored_value)
+
+    def test_yielding_boolean_option_with_falsy_parent(self):
+        """Test that yielding is correctly initialized when parent option value is False."""
+        optstore = OptionStore(False)
+        name = 'someoption'
+        subproject_name = 'sub'
+        parent_option = UserBooleanOption(name, 'A parent boolean option', False, yielding=True)
+        optstore.add_project_option(OptionKey(name, ''), parent_option)
+
+        child_option = UserBooleanOption(name, 'A child boolean option', True, yielding=True)
+        child_key = OptionKey(name, subproject_name)
+        optstore.add_project_option(child_key, child_option)
+        self.assertTrue(optstore.options[child_key].yielding)
+
+    def test_machine_canonicalization_cross(self):
+        """Test that BUILD machine options are handled correctly in cross compilation."""
+        optstore = OptionStore(True)
+
+        # Test that BUILD machine per-machine option is NOT canonicalized to HOST
+        host_pkg_config = OptionKey('pkg_config_path', machine=MachineChoice.HOST)
+        build_pkg_config = OptionKey('pkg_config_path', machine=MachineChoice.BUILD)
+        host_option_obj = UserStringArrayOption('pkg_config_path', 'Host pkg-config paths', ['/mingw/lib64/pkgconfig'])
+        build_option_obj = UserStringArrayOption('pkg_config_path', 'Build pkg-config paths', ['/usr/lib64/pkgconfig'])
+        optstore.add_system_option(host_pkg_config, host_option_obj)
+        optstore.add_system_option(build_pkg_config, build_option_obj)
+        option, value = optstore.get_option_and_value_for(build_pkg_config)
+        self.assertEqual(value, ['/usr/lib64/pkgconfig'])
+
+        # Test that non-per-machine BUILD option IS canonicalized to HOST
+        build_opt = OptionKey('optimization', machine=MachineChoice.BUILD)
+        host_opt = OptionKey('optimization', machine=MachineChoice.HOST)
+        common_option_obj = UserComboOption('optimization', 'Optimization level', '0',
+                                            choices=['plain', '0', 'g', '1', '2', '3', 's'])
+        optstore.add_system_option(host_opt, common_option_obj)
+        self.assertEqual(optstore.get_value_for(build_opt), '0')
+
+    def test_machine_canonicalization_native(self):
+        """Test that BUILD machine options are canonicalized to HOST when not cross compiling."""
+        optstore = OptionStore(False)
+
+        host_pkg_config = OptionKey('pkg_config_path', machine=MachineChoice.HOST)
+        build_pkg_config = OptionKey('pkg_config_path', machine=MachineChoice.BUILD)
+        host_option_obj = UserStringArrayOption('pkg_config_path', 'Host pkg-config paths', ['/mingw/lib64/pkgconfig'])
+        build_option_obj = UserStringArrayOption('pkg_config_path', 'Build pkg-config paths', ['/usr/lib64/pkgconfig'])
+
+        # Add per-machine option for HOST only (BUILD will be canonicalized)
+        optstore.add_system_option(host_pkg_config, host_option_obj)
+        option, value = optstore.get_option_and_value_for(build_pkg_config)
+        self.assertEqual(value, ['/mingw/lib64/pkgconfig'])
+
+        # Try again adding build option too, for completeness
+        optstore.add_system_option(build_pkg_config, build_option_obj)
+        option, value = optstore.get_option_and_value_for(build_pkg_config)
+        self.assertEqual(value, ['/mingw/lib64/pkgconfig'])
+
+    def test_sanitize_prefix_windows_host(self):
+        """Test that Windows paths are accepted when host is Windows."""
+        optstore = OptionStore(True)  # cross-compile
+        optstore.set_host_machine(make_machine('windows'))
+        result = optstore.sanitize_prefix('C:\\Windows')
+        self.assertEqual(result, 'C:\\Windows')
+        result = optstore.sanitize_prefix('\\\\server\\share')
+        self.assertEqual(result, '\\\\server\\share')
+        # Forward slashes should also be accepted on Windows
+        result = optstore.sanitize_prefix('C:/Windows')
+        self.assertEqual(result, 'C:/Windows')
+        result = optstore.sanitize_prefix('//server/share')
+        self.assertEqual(result, '//server/share')
+
+    def test_sanitize_prefix_posix_host(self):
+        """Test that POSIX paths are accepted when host is POSIX."""
+        optstore = OptionStore(True)  # cross-compile
+        optstore.set_host_machine(make_machine('linux'))
+        result = optstore.sanitize_prefix('/usr/local')
+        self.assertEqual(result, '/usr/local')
+        # Windows path should be rejected
+        with self.assertRaises(MesonException):
+            optstore.sanitize_prefix('\\myprog')
+        with self.assertRaises(MesonException):
+            optstore.sanitize_prefix('C:\\Windows')
+        with self.assertRaises(MesonException):
+            optstore.sanitize_prefix('C:/Windows')
+        with self.assertRaises(MesonException):
+            optstore.sanitize_prefix('\\\\server\\share')
+        # This one is not parsed as UNC
+        result = optstore.sanitize_prefix('//server/share')
+        self.assertEqual(result, '//server/share')
+
+    def test_sanitize_prefix_cygwin_host(self):
+        """Test that Cygwin uses POSIX-style paths."""
+        optstore = OptionStore(True)
+        optstore.set_host_machine(make_machine('cygwin'))
+        result = optstore.sanitize_prefix('/usr/local')
+        self.assertEqual(result, '/usr/local')
+        result = optstore.sanitize_prefix('/cygdrive/c/Windows')
+        self.assertEqual(result, '/cygdrive/c/Windows')
+
+    def test_sanitize_dir_option_cross_to_windows(self):
+        """Test directory option sanitization when cross-compiling to Windows."""
+        optstore = OptionStore(True)
+        optstore.set_host_machine(make_machine('windows'))
+        optstore.init_builtins()
+        # Set libdir to absolute path inside prefix, should be relativized
+        optstore.set_option(OptionKey('prefix'), 'C:\\Program Files\\MyProg')
+        optstore.set_option(OptionKey('libdir'), 'C:\\Program Files\\MyProg\\lib')
+        self.assertEqual(optstore.get_value_for('libdir'), 'lib')
+
+    def test_sanitize_dir_option_cross_to_linux(self):
+        """Test directory option sanitization when cross-compiling to Linux."""
+        optstore = OptionStore(True)
+        optstore.set_host_machine(make_machine('linux'))
+        optstore.init_builtins()
+        # Set libdir to absolute path inside prefix, should be relativized
+        optstore.set_option(OptionKey('prefix'), '/opt/myapp')
+        optstore.set_option(OptionKey('libdir'), '/opt/myapp/lib64')
+        self.assertEqual(optstore.get_value_for('libdir'), 'lib64')
+
+    def test_sanitize_prefix_native_path(self):
+        """Test that native paths are accepted without set_host_machine()."""
+        optstore = OptionStore(False)
+        native_path = os.sep + 'myprog'
+        result = optstore.sanitize_prefix(native_path)
+        self.assertEqual(result, native_path)
+
+    def test_is_host_absolute(self):
+        """Test _is_host_absolute with various host configurations."""
+        # POSIX host
+        optstore = OptionStore(True)
+        optstore.set_host_machine(make_machine('linux'))
+        self.assertTrue(optstore._is_host_absolute('/usr'))
+        self.assertTrue(optstore._is_host_absolute('/usr/local'))
+        self.assertFalse(optstore._is_host_absolute('relative'))
+        self.assertFalse(optstore._is_host_absolute('C:\\Windows'))
+        self.assertFalse(optstore._is_host_absolute('C:/Windows'))
+
+        # Windows host - accepts both full absolute and root-relative
+        optstore = OptionStore(True)
+        optstore.set_host_machine(make_machine('windows'))
+        self.assertTrue(optstore._is_host_absolute('C:\\Windows'))
+        self.assertTrue(optstore._is_host_absolute('C:/Windows'))
+        self.assertTrue(optstore._is_host_absolute('//server/share'))
+        self.assertTrue(optstore._is_host_absolute('\\\\server\\share'))
+        # Root-relative paths accepted for backwards compat
+        self.assertTrue(optstore._is_host_absolute('/usr'))
+        self.assertTrue(optstore._is_host_absolute('\\myprog'))
+        self.assertFalse(optstore._is_host_absolute('relative'))
+
+        # No host set - uses build machine semantics
+        optstore = OptionStore(False)
+        self.assertTrue(optstore._is_host_absolute(os.sep + 'myprog'))
+        self.assertTrue(optstore._is_host_absolute('/myprog'))

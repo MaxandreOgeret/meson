@@ -12,6 +12,10 @@ description: |
   custom_target('foo', output: 'file.txt', ...)
   ```
 
+  The files passed to `output:` cannot contain path separators. See the 
+  [manual on custom build targets](Custom-build-targets.md#details-on-command-invocation) for
+  an explanation on where output files should be placed.
+
   You can install the outputted files with the `install_dir:` kwarg, see below.
 
   *Since 0.60.0* the name argument is optional and defaults to the basename of the first
@@ -98,6 +102,24 @@ kwargs:
       Useful for things such as build timestamps or revision control tags.
       The associated command is run even if the outputs are up to date.
 
+  build_subdir:
+    type: str
+    since: 1.10.0
+    description:
+      Places the build results in a subdirectory of the given name
+      rather than directly into the build directory. This does not
+      affect the install directory, which uses install_dir.
+
+      This allows inserting a directory name into the build path,
+      either when needed to use the build result while building other
+      targets or as a way to support multiple targets with the same
+      basename by using unique build_subdir values for each one.
+
+      To prevent collisions within the build directory, build_subdir
+      is not allowed to match a file or directory in the source
+      directory, nor contain '..' to refer to the parent of the build
+      directory.
+
   capture:
     type: bool
     default: false
@@ -120,7 +142,7 @@ kwargs:
       serializing all targets in this pool.
 
   command:
-    type: array[str | file | exe | external_program]
+    type: array[str | file | exe | program]
     description: |
       Command to run to create outputs from inputs. The command
       may be strings or the return value of functions that return file-like
@@ -133,6 +155,9 @@ kwargs:
       '-arg1', '-arg2']` rather than as a string `'commandname -arg1
       -arg2'` as the latter will *not* work.
 
+      *Note:* due to an [issue with path handling](https://github.com/mesonbuild/meson/issues/1564)
+      any backslash (`\`) characters are rewritten as slash (`/`).
+
   depend_files:
     type: array[str | file]
     description: |
@@ -142,7 +167,7 @@ kwargs:
       argument. Useful for adding regen dependencies.
 
   depends:
-    type: array[build_tgt | custom_tgt | custom_idx]
+    type: array[build_tgt | custom_tgt | custom_idx | program]
     description: |
       Specifies that this target depends on the specified
       target(s), even though it does not take any of them as a command
@@ -150,7 +175,7 @@ kwargs:
       e.g. does globbing internally. Usually you should just put the
       generated sources as inputs and Meson will set up all dependencies
       automatically (custom_idx was unavailable as a type between 0.60
-      and 1.4.0).
+      and 1.4.0).  `program` is supported *since 1.11.2*.
 
   depfile:
     type: str
@@ -164,8 +189,10 @@ kwargs:
       are also accepted.
 
   input:
-    type: array[str | file]
-    description: Array of source files. *(since 0.41.0)* the array is flattened.
+    type: array[str | file | program]
+    description: |
+      Array of source files. *(since 0.41.0)* the array is flattened.
+      `program` is supported *since 1.11.2*.
 
   install:
     type: bool
@@ -217,7 +244,8 @@ kwargs:
 
   output:
     type: array[str]
-    description: Array of output files.
+    description: |
+      Array of output files. These cannot contain path separators.
 
   env:
     since: 0.57.0

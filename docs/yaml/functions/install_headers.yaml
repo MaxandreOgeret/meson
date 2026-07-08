@@ -11,7 +11,7 @@ description: |
 
   Please note that this can only install static files from the source tree.
   Generated files are installed via the `install_dir:` kwarg on the respective
-  generators, such as `custom_target()` or `configure_file().
+  generators, such as `custom_target()` or `configure_file()`.
 
 example: |
   For example, this will install `common.h` and `kola.h` into
@@ -85,3 +85,11 @@ kwargs:
     description: |
       If true, dereferences links and copies their target instead.  The default
       value will become false in the future.
+
+  install_tag:
+    type: str
+    since: 1.11.0
+    description: |
+      A string used by the `meson install --tags` command
+      to install only a subset of the files. By default these files have the `devel`
+      install tag which means they are installed explicitly or when no tags given at all.
