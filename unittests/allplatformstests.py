@@ -3360,6 +3360,23 @@ class AllPlatformTests(BasePlatformTests):
         self.build()
         self.run_tests()
 
+    def test_subproject_lang_args(self):
+        testdir = os.path.join(self.unit_test_dir, '139 subproject lang args')
+        self.init(testdir, extra_args=['-Dc_args=-DTOP_FLAG', '-Dsub:c_args=-DSUB_FLAG'])
+        # The source files #error out if their expected flag is missing.
+        self.build()
+        # A per-subproject or per-target value replaces the global one.
+        for cmd in self.get_compdb():
+            if cmd['file'].endswith('top.c'):
+                self.assertIn('-DTOP_FLAG', cmd['command'])
+                self.assertNotIn('-DSUB_FLAG', cmd['command'])
+            elif cmd['file'].endswith('sub.c'):
+                self.assertIn('-DSUB_FLAG', cmd['command'])
+                self.assertNotIn('-DTOP_FLAG', cmd['command'])
+            elif cmd['file'].endswith('over.c'):
+                self.assertIn('-DOVERRIDE_FLAG', cmd['command'])
+                self.assertNotIn('-DTOP_FLAG', cmd['command'])
+
     def test_wipe_from_builddir(self):
         testdir = os.path.join(self.common_test_dir, '157 custom target subdir depend files')
         self.init(testdir)
@@ -3635,6 +3652,24 @@ class AllPlatformTests(BasePlatformTests):
         optnames = [o['name'] for o in res]
         self.assertIn('c_args', optnames)
         self.assertNotIn('build.c_args', optnames)
+
+    def test_introspect_buildoptions_subproject_augments(self):
+        testdir = os.path.join(self.unit_test_dir, '47 reconfigure')
+        self.init(testdir, extra_args=['-Dsub1:c_args=-DAUG', '-Dsub1:werror=true'])
+        res = self.introspect('--buildoptions')
+        opts = {o['name']: o for o in res}
+        self.assertEqual(opts['sub1:c_args']['value'], ['-DAUG'])
+        self.assertEqual(opts['sub1:werror']['value'], True)
+        # Non-yielding builtins get a row per subproject.
+        self.assertIn('sub1:warning_level', opts)
+        # The generated intro file matches the introspect command.
+        infofile = os.path.join(self.builddir, 'meson-info', 'intro-buildoptions.json')
+        with open(infofile, encoding='utf-8') as fp:
+            self.assertListEqual(json.load(fp), res)
+        # Source-only introspection takes the same path and must not crash.
+        testfile = os.path.join(testdir, 'meson.build')
+        res_nb = self.introspect_directory(testfile, ['--buildoptions'] + self.meson_args)
+        self.assertIn('sub1:warning_level', {o['name'] for o in res_nb})
 
     def test_introspect_json_flat(self):
         testdir = os.path.join(self.unit_test_dir, '56 introspection')
@@ -4189,6 +4224,14 @@ class AllPlatformTests(BasePlatformTests):
         testdir = os.path.join(self.common_test_dir, '2 cpp')
         self.init(testdir)
         self._run(self.mconf_command + [self.builddir])
+
+    def test_configure_with_augments(self):
+        # A list-valued augment used to crash `meson configure <builddir>`.
+        testdir = os.path.join(self.unit_test_dir, '47 reconfigure')
+        self.init(testdir, extra_args=['-Dsub1:c_args=-DFOO'])
+        out = self._run(self.mconf_command + [self.builddir])
+        self.assertIn('sub1:c_args', out)
+        self.assertIn('[-DFOO]', out)
 
     def test_summary(self):
         testdir = os.path.join(self.unit_test_dir, '71 summary')
@@ -4927,11 +4970,11 @@ class AllPlatformTests(BasePlatformTests):
 
             # C does have a separate linking step. It can be done through the compiler
             # driver or not; act accordingly.
+            link_args = env.coredata.optstore.get_value_for(OptionKey(f'{cc.language}_link_args', machine=cc.for_machine))
+            assert isinstance(link_args, list), 'for mypy'
             if cc.USED_FOR_SEPARATE_LINKING_STEP:
-                link_args = env.coredata.get_external_link_args(cc.for_machine, cc.language)
                 self.assertEqual(sorted(link_args), sorted(['-DCFLAG', '-flto']))
             else:
-                link_args = env.coredata.get_external_link_args(cc.for_machine, cc.language)
                 self.assertEqual(sorted(link_args), sorted(['-flto']))
 
     def test_install_tag(self) -> None:
